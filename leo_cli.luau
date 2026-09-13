@@ -145,8 +145,11 @@ local function Reader(data)
 	return self
 end
 
+-- Roblox client bytecode encrypts the opcode byte: real_op = (enc * 203) % 256
+local ROBLOX_OP_KEY = 203
 local function insn_op(insn)
-	return bit32.band(insn, 255)
+	local enc = bit32.band(insn, 255)
+	return (enc * ROBLOX_OP_KEY) % 256
 end
 local function insn_a(insn)
 	return bit32.band(bit32.rshift(insn, 8), 255)

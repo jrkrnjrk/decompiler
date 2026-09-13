@@ -16,6 +16,8 @@ const LUAU_BIN = process.env.LUAU_BIN || "luau";
 const LEO_CLI = path.join(__dirname, "leo_cli.luau");
 const MAX_BODY = 8 * 1024 * 1024;
 const TIMEOUT_MS = Number(process.env.DECOMPILE_TIMEOUT_MS || 45000);
+const cache = new Map(); // key: b64 (or hash), value: source
+const CACHE_MAX = 500;
 
 app.use(express.json({ limit: MAX_BODY }));
 app.use(express.text({ type: "*/*", limit: MAX_BODY }));
@@ -148,8 +150,17 @@ app.post("/decompile", async (req, res) => {
       return res.status(400).json({ ok: false, error: "bytecode too short" });
     }
 
+    if (cache.has(b64)) {
+      console.log(`[decompile] cache hit len=${b64.length}`);
+      return res.json({ ok: true, source: cache.get(b64), cached: true });
+    }
     console.log(`[decompile] b64 length=${b64.length}`);
     const source = await runLeo(b64);
+    if (cache.size >= CACHE_MAX) {
+      const first = cache.keys().next().value;
+      cache.delete(first);
+    }
+    cache.set(b64, source || "");
     console.log(`[decompile] ok source length=${(source || "").length}`);
     res.json({ ok: true, source: source || "" });
   } catch (err) {
