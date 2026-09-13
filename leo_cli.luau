@@ -550,377 +550,387 @@ end
 local function lift_proto(chunk, proto, is_main, indent)
 	indent = indent or 0
 	local pad = string.rep("    ", indent)
-	local inner_pad = is_main and pad or (pad .. "    ")
-	local nregs = math.max(proto.maxstacksize, proto.numparams) + 8
+	local insns = proto.instructions
+	local n = #insns
+
+	local pc_to_idx = {}
+	for idx, ins in insns do
+		pc_to_idx[ins.pc] = idx
+	end
+	local function idx_at_pc(pc)
+		return pc_to_idx[pc]
+	end
+
+	local is_cond_jump = {
+		[OP.JUMPIF] = true, [OP.JUMPIFNOT] = true,
+		[OP.JUMPIFEQ] = true, [OP.JUMPIFLE] = true, [OP.JUMPIFLT] = true,
+		[OP.JUMPIFNOTEQ] = true, [OP.JUMPIFNOTLE] = true, [OP.JUMPIFNOTLT] = true,
+		[OP.JUMPXEQKNIL] = true, [OP.JUMPXEQKB] = true, [OP.JUMPXEQKN] = true, [OP.JUMPXEQKS] = true,
+	}
+	local is_meta = {
+		[OP.FASTCALL] = true, [OP.FASTCALL1] = true, [OP.FASTCALL2] = true, [OP.FASTCALL2K] = true,
+		[OP.FASTCALL3] = true, [OP.FASTPCALL] = true, [OP.NOP] = true, [OP.BREAK] = true,
+		[OP.COVERAGE] = true, [OP.PREPVARARGS] = true, [OP.CLOSEUPVALS] = true, [OP.NATIVECALL] = true,
+		[OP.CAPTURE] = true,
+	}
+
+	local nregs = math.max(proto.maxstacksize, proto.numparams) + 16
 	local regs = table.create(nregs)
-	for i = 0, nregs - 1 do
-		regs[i] = default_reg_name(proto, i)
+	for r = 0, nregs - 1 do
+		regs[r] = default_reg_name(proto, r)
 	end
 	local declared = {}
-	local statements = {}
-
 	for _, lv in proto.locvars do
 		if lv.startpc == 0 and regs[lv.reg] ~= nil then
 			regs[lv.reg] = sanitize_name(lv.name)
 		end
 	end
-
 	local params = {}
-	for i = 0, proto.numparams - 1 do
-		params[#params + 1] = regs[i]
-		declared[i] = true
+	for r = 0, proto.numparams - 1 do
+		params[#params + 1] = regs[r]
+		declared[r] = true
 	end
 	if proto.is_vararg ~= 0 then
 		params[#params + 1] = "..."
 	end
 
-	if not is_main then
-		local fname = proto.debugname and sanitize_name(proto.debugname) or ("anon_" .. proto.index)
-		statements[#statements + 1] = pad .. "function " .. fname .. "(" .. table.concat(params, ", ") .. ")"
+	local lines = {}
+	local function emit(s)
+		lines[#lines + 1] = s
 	end
-
-	local function expr_of(reg)
-		return regs[reg] or ("r" .. reg)
+	local function expr_of(r)
+		return regs[r] or ("v" .. r)
 	end
-
-	local function slot_name(reg, pc)
+	local function slot(reg, pc)
 		return local_name_at(proto, reg, pc) or (reg < proto.numparams and ("arg" .. (reg + 1)) or ("v" .. reg))
 	end
-
-	local function assign(reg, expr, pc)
-		local name = slot_name(reg, pc)
-		regs[reg] = name
-		if reg < proto.numparams then
-			statements[#statements + 1] = inner_pad .. name .. " = " .. expr
-			declared[reg] = true
-			return
-		end
-		if not declared[reg] then
-			statements[#statements + 1] = inner_pad .. "local " .. name .. " = " .. expr
-			declared[reg] = true
+	local function set_expr(r, e)
+		regs[r] = e
+	end
+	local function bind_local(reg, expr, pc, ip)
+		local name = slot(reg, pc)
+		if declared[reg] or reg < proto.numparams then
+			emit(ip .. name .. " = " .. expr)
 		else
-			statements[#statements + 1] = inner_pad .. name .. " = " .. expr
+			emit(ip .. "local " .. name .. " = " .. expr)
+			declared[reg] = true
 		end
+		regs[reg] = name
+		return name
 	end
 
-	local function set_temp(reg, expr)
-		regs[reg] = expr
-	end
-
-	local pending_namecall = nil
-	local i = 1
-	local insns = proto.instructions
-	while i <= #insns do
-		local ins = insns[i]
-		local op, A, B, C, D, aux = ins.op, ins.a, ins.b, ins.c, ins.d, ins.aux
-
-		if op == OP.FASTCALL or op == OP.FASTCALL1 or op == OP.FASTCALL2 or op == OP.FASTCALL2K or op == OP.FASTCALL3 or op == OP.FASTPCALL
-			or op == OP.NOP or op == OP.BREAK or op == OP.COVERAGE or op == OP.PREPVARARGS or op == OP.CLOSEUPVALS or op == OP.NATIVECALL then
-			i += 1
-			continue
-		end
-
-		if op == OP.LOADNIL then
-			set_temp(A, "nil")
-			assign(A, "nil", ins.pc)
-		elseif op == OP.LOADB then
-			local val = B ~= 0 and "true" or "false"
-			set_temp(A, val)
-			assign(A, val, ins.pc)
-		elseif op == OP.LOADN then
-			set_temp(A, tostring(D))
-			assign(A, tostring(D), ins.pc)
-		elseif op == OP.LOADK then
-			local val = k_text(proto, D)
-			set_temp(A, val)
-			assign(A, val, ins.pc)
-		elseif op == OP.LOADKX then
-			local val = k_text(proto, aux or 0)
-			set_temp(A, val)
-			assign(A, val, ins.pc)
-		elseif op == OP.MOVE then
-			local src = expr_of(B)
-			set_temp(A, src)
-			assign(A, src, ins.pc)
-		elseif op == OP.GETGLOBAL then
-			local key = k_text(proto, aux or 0)
-			local val = (string.sub(key, 1, 1) == '"' and is_ident(string.sub(key, 2, -2))) and string.sub(key, 2, -2) or ("_G[" .. key .. "]")
-			set_temp(A, val)
-			assign(A, val, ins.pc)
-		elseif op == OP.SETGLOBAL then
-			local key = k_text(proto, aux or 0)
-			local name = (string.sub(key, 1, 1) == '"' and is_ident(string.sub(key, 2, -2))) and string.sub(key, 2, -2) or ("_G[" .. key .. "]")
-			statements[#statements + 1] = inner_pad .. name .. " = " .. expr_of(A)
-		elseif op == OP.GETUPVAL then
-			local uname = sanitize_name(proto.upvalue_names[B + 1] or ("up" .. B))
-			set_temp(A, uname)
-			assign(A, uname, ins.pc)
-		elseif op == OP.SETUPVAL then
-			local uname = sanitize_name(proto.upvalue_names[B + 1] or ("up" .. B))
-			statements[#statements + 1] = inner_pad .. uname .. " = " .. expr_of(A)
-		elseif op == OP.GETIMPORT then
-			local val = k_text(proto, D)
-			set_temp(A, val)
-			assign(A, val, ins.pc)
-		elseif op == OP.GETTABLE then
-			local val = expr_of(B) .. "[" .. expr_of(C) .. "]"
-			set_temp(A, val)
-			assign(A, val, ins.pc)
-		elseif op == OP.SETTABLE then
-			statements[#statements + 1] = inner_pad .. expr_of(B) .. "[" .. expr_of(C) .. "] = " .. expr_of(A)
-		elseif op == OP.GETTABLEKS or op == OP.GETUDATAKS then
-			local kid = (op == OP.GETUDATAKS and aux) and bit32.band(aux, 65535) or (aux or 0)
-			local val = index_expr(expr_of(B), k_text(proto, kid))
-			set_temp(A, val)
-			assign(A, val, ins.pc)
-		elseif op == OP.SETTABLEKS or op == OP.SETUDATAKS then
-			local kid = (op == OP.SETUDATAKS and aux) and bit32.band(aux, 65535) or (aux or 0)
-			statements[#statements + 1] = inner_pad .. index_expr(expr_of(B), k_text(proto, kid)) .. " = " .. expr_of(A)
-		elseif op == OP.GETTABLEN then
-			local val = expr_of(B) .. "[" .. (C + 1) .. "]"
-			set_temp(A, val)
-			assign(A, val, ins.pc)
-		elseif op == OP.SETTABLEN then
-			statements[#statements + 1] = inner_pad .. expr_of(B) .. "[" .. (C + 1) .. "] = " .. expr_of(A)
-		elseif op == OP.NAMECALL or op == OP.NAMECALLUDATA then
-			local kid = (op == OP.NAMECALLUDATA and aux) and bit32.band(aux, 65535) or (aux or 0)
-			local method = k_text(proto, kid)
-			local mname = string.sub(method, 1, 1) == '"' and string.sub(method, 2, -2) or method
-			pending_namecall = { A, expr_of(B), mname }
-			set_temp(A, expr_of(B) .. ":" .. mname)
-			set_temp(A + 1, expr_of(B))
-		elseif op == OP.CALL or op == OP.CALLFB then
-			local nrets = C - 1
-			local call
-			if pending_namecall and pending_namecall[1] == A then
-				local obj, method = pending_namecall[2], pending_namecall[3]
-				pending_namecall = nil
-				local args
-				if B == 0 then
-					args = "..."
-				else
-					local parts = {}
-					for j = 0, math.max(B - 2, 0) - 1 do
-						parts[#parts + 1] = expr_of(A + 2 + j)
-					end
-					args = table.concat(parts, ", ")
-				end
-				call = obj .. ":" .. method .. "(" .. args .. ")"
-			else
-				local args
-				if B == 0 then
-					args = "..."
-				else
-					local parts = {}
-					for j = 0, math.max(B - 1, 0) - 1 do
-						parts[#parts + 1] = expr_of(A + 1 + j)
-					end
-					args = table.concat(parts, ", ")
-				end
-				call = expr_of(A) .. "(" .. args .. ")"
-			end
-			if nrets == 0 then
-				statements[#statements + 1] = inner_pad .. call
-			elseif nrets == 1 or nrets < 0 then
-				assign(A, call, ins.pc)
-			else
-				local names = {}
-				for j = 0, nrets - 1 do
-					local nm = local_name_at(proto, A + j, ins.pc) or ("v" .. (A + j))
-					names[#names + 1] = nm
-					regs[A + j] = nm
-					declared[A + j] = true
-				end
-				statements[#statements + 1] = inner_pad .. "local " .. table.concat(names, ", ") .. " = " .. call
-			end
-		elseif op == OP.RETURN then
-			if B == 1 then
-				if not is_main then
-					statements[#statements + 1] = inner_pad .. "return"
-				end
-			elseif B == 0 then
-				statements[#statements + 1] = inner_pad .. "return ..."
-			else
-				local vals = {}
-				for j = 0, B - 2 do
-					vals[#vals + 1] = expr_of(A + j)
-				end
-				statements[#statements + 1] = inner_pad .. "return " .. table.concat(vals, ", ")
-			end
-		elseif op == OP.JUMP or op == OP.JUMPBACK or op == OP.JUMPX then
-			local off = op == OP.JUMPX and ins.e or D
-			statements[#statements + 1] = inner_pad .. "goto label_" .. (ins.pc + 1 + off) .. " -- " .. ins.name
+	local function if_condition(ins)
+		local op, A, aux = ins.op, ins.a, ins.aux
+		-- Emit condition for the FALLTHROUGH body (invert jump-if-true)
+		if op == OP.JUMPIFNOT then
+			return expr_of(A)
 		elseif op == OP.JUMPIF then
-			statements[#statements + 1] = inner_pad .. "if " .. expr_of(A) .. " then goto label_" .. (ins.pc + 1 + D) .. " end"
-		elseif op == OP.JUMPIFNOT then
-			statements[#statements + 1] = inner_pad .. "if not " .. expr_of(A) .. " then goto label_" .. (ins.pc + 1 + D) .. " end"
-		elseif op == OP.JUMPIFEQ or op == OP.JUMPIFLE or op == OP.JUMPIFLT or op == OP.JUMPIFNOTEQ or op == OP.JUMPIFNOTLE or op == OP.JUMPIFNOTLT then
-			local opsym = ({
-				[OP.JUMPIFEQ] = "==",
-				[OP.JUMPIFLE] = "<=",
-				[OP.JUMPIFLT] = "<",
-				[OP.JUMPIFNOTEQ] = "~=",
-				[OP.JUMPIFNOTLE] = ">",
-				[OP.JUMPIFNOTLT] = ">=",
-			})[op]
-			statements[#statements + 1] = inner_pad .. "if " .. expr_of(A) .. " " .. opsym .. " " .. expr_of(aux or 0) .. " then goto label_" .. (ins.pc + 1 + D) .. " end"
+			return "not " .. expr_of(A)
+		elseif op == OP.JUMPIFEQ then
+			return expr_of(A) .. " ~= " .. expr_of(aux or 0)
+		elseif op == OP.JUMPIFNOTEQ then
+			return expr_of(A) .. " == " .. expr_of(aux or 0)
+		elseif op == OP.JUMPIFLT then
+			return expr_of(A) .. " >= " .. expr_of(aux or 0)
+		elseif op == OP.JUMPIFLE then
+			return expr_of(A) .. " > " .. expr_of(aux or 0)
+		elseif op == OP.JUMPIFNOTLT then
+			return expr_of(A) .. " < " .. expr_of(aux or 0)
+		elseif op == OP.JUMPIFNOTLE then
+			return expr_of(A) .. " <= " .. expr_of(aux or 0)
 		elseif op == OP.JUMPXEQKNIL then
 			local inv = bit32.rshift(aux or 0, 31)
-			statements[#statements + 1] = inner_pad .. "if " .. expr_of(A) .. (inv == 0 and " == nil" or " ~= nil") .. " then goto label_" .. (ins.pc + 1 + D) .. " end"
+			return expr_of(A) .. (inv == 0 and " ~= nil" or " == nil")
 		elseif op == OP.JUMPXEQKB then
 			local inv = bit32.rshift(aux or 0, 31)
 			local lit = bit32.band(aux or 0, 1) ~= 0 and "true" or "false"
-			statements[#statements + 1] = inner_pad .. "if " .. expr_of(A) .. (inv == 0 and " == " or " ~= ") .. lit .. " then goto label_" .. (ins.pc + 1 + D) .. " end"
+			return expr_of(A) .. (inv == 0 and " ~= " or " == ") .. lit
 		elseif op == OP.JUMPXEQKN or op == OP.JUMPXEQKS then
 			local inv = bit32.rshift(aux or 0, 31)
 			local kid = bit32.band(aux or 0, 0xFFFFFF)
-			statements[#statements + 1] = inner_pad .. "if " .. expr_of(A) .. (inv == 0 and " == " or " ~= ") .. k_text(proto, kid) .. " then goto label_" .. (ins.pc + 1 + D) .. " end"
-		elseif op == OP.ADD or op == OP.SUB or op == OP.MUL or op == OP.DIV or op == OP.MOD or op == OP.POW or op == OP.IDIV then
-			local opsym = ({ [OP.ADD] = "+", [OP.SUB] = "-", [OP.MUL] = "*", [OP.DIV] = "/", [OP.MOD] = "%", [OP.POW] = "^", [OP.IDIV] = "//" })[op]
-			local val = "(" .. expr_of(B) .. " " .. opsym .. " " .. expr_of(C) .. ")"
-			set_temp(A, val)
-			assign(A, val, ins.pc)
-		elseif op == OP.ADDK or op == OP.SUBK or op == OP.MULK or op == OP.DIVK or op == OP.MODK or op == OP.POWK or op == OP.IDIVK then
-			local opsym = ({ [OP.ADDK] = "+", [OP.SUBK] = "-", [OP.MULK] = "*", [OP.DIVK] = "/", [OP.MODK] = "%", [OP.POWK] = "^", [OP.IDIVK] = "//" })[op]
-			local val = "(" .. expr_of(B) .. " " .. opsym .. " " .. k_text(proto, C) .. ")"
-			set_temp(A, val)
-			assign(A, val, ins.pc)
-		elseif op == OP.SUBRK then
-			local val = "(" .. k_text(proto, B) .. " - " .. expr_of(C) .. ")"
-			set_temp(A, val)
-			assign(A, val, ins.pc)
-		elseif op == OP.DIVRK then
-			local val = "(" .. k_text(proto, B) .. " / " .. expr_of(C) .. ")"
-			set_temp(A, val)
-			assign(A, val, ins.pc)
-		elseif op == OP.AND then
-			local val = "(" .. expr_of(B) .. " and " .. expr_of(C) .. ")"
-			set_temp(A, val)
-			assign(A, val, ins.pc)
-		elseif op == OP.OR then
-			local val = "(" .. expr_of(B) .. " or " .. expr_of(C) .. ")"
-			set_temp(A, val)
-			assign(A, val, ins.pc)
-		elseif op == OP.ANDK then
-			local val = "(" .. expr_of(B) .. " and " .. k_text(proto, C) .. ")"
-			set_temp(A, val)
-			assign(A, val, ins.pc)
-		elseif op == OP.ORK then
-			local val = "(" .. expr_of(B) .. " or " .. k_text(proto, C) .. ")"
-			set_temp(A, val)
-			assign(A, val, ins.pc)
-		elseif op == OP.CONCAT then
-			local parts = {}
-			for j = B, C do
-				parts[#parts + 1] = expr_of(j)
-			end
-			local val = table.concat(parts, " .. ")
-			set_temp(A, val)
-			assign(A, val, ins.pc)
-		elseif op == OP.NOT then
-			local val = "(not " .. expr_of(B) .. ")"
-			set_temp(A, val)
-			assign(A, val, ins.pc)
-		elseif op == OP.MINUS then
-			local val = "(-" .. expr_of(B) .. ")"
-			set_temp(A, val)
-			assign(A, val, ins.pc)
-		elseif op == OP.LENGTH then
-			local val = "#" .. expr_of(B)
-			set_temp(A, val)
-			assign(A, val, ins.pc)
-		elseif op == OP.NEWTABLE then
-			set_temp(A, "{}")
-			assign(A, "{}", ins.pc)
-		elseif op == OP.DUPTABLE then
-			local val = k_text(proto, D)
-			set_temp(A, val)
-			assign(A, val, ins.pc)
-		elseif op == OP.SETLIST then
-			local count = B - 1
-			local start = aux or 1
-			if count >= 0 then
-				for j = 0, count - 1 do
-					statements[#statements + 1] = inner_pad .. expr_of(A) .. "[" .. (start + j) .. "] = " .. expr_of(A + 1 + j)
-				end
-			end
-		elseif op == OP.FORNPREP then
-			statements[#statements + 1] = inner_pad .. "for " .. expr_of(A + 3) .. " = " .. expr_of(A + 2) .. ", " .. expr_of(A) .. ", " .. expr_of(A + 1) .. " do"
-		elseif op == OP.FORNLOOP then
-			statements[#statements + 1] = inner_pad .. "end -- numeric for"
-		elseif op == OP.FORGPREP or op == OP.FORGPREP_INEXT or op == OP.FORGPREP_NEXT then
-			statements[#statements + 1] = inner_pad .. "-- generic for prep " .. ins.name
-		elseif op == OP.FORGLOOP then
-			local nvars = bit32.band(aux or 2, 255)
-			local vars = {}
-			for j = 0, math.max(nvars, 1) - 1 do
-				vars[#vars + 1] = expr_of(A + 3 + j)
-			end
-			statements[#statements + 1] = inner_pad .. "for " .. table.concat(vars, ", ") .. " in " .. expr_of(A) .. " do end -- generic for"
-		elseif op == OP.GETVARARGS then
-			if B == 0 then
-				assign(A, "...", ins.pc)
-			elseif B > 1 then
-				local names = {}
-				for j = 0, B - 2 do
-					local nm = local_name_at(proto, A + j, ins.pc) or ("v" .. (A + j))
-					names[#names + 1] = nm
-					declared[A + j] = true
-					regs[A + j] = nm
-				end
-				statements[#statements + 1] = inner_pad .. "local " .. table.concat(names, ", ") .. " = ..."
-			end
-		elseif op == OP.NEWCLOSURE or op == OP.DUPCLOSURE then
-			local cid
-			if op == OP.NEWCLOSURE then
-				cid = proto.child_ids[D + 1] or D
-			else
-				local ck = proto.constants[D + 1]
-				cid = (ck and ck.kind == "closure" and ck.value) or D
-			end
-			local j = i + 1
-			while j <= #insns and insns[j].op == OP.CAPTURE do
-				j += 1
-			end
-			local child = chunk.protos[cid + 1]
-			if child then
-				local fname = child.debugname and sanitize_name(child.debugname) or ("anon_" .. child.index)
-				statements[#statements + 1] = lift_proto(chunk, child, false, indent + (is_main and 0 or 1))
-				set_temp(A, fname)
-				if not declared[A] and A >= proto.numparams then
-					declared[A] = true
-					regs[A] = fname
-				else
-					assign(A, fname, ins.pc)
-				end
-			else
-				assign(A, "function(...) end -- missing proto " .. tostring(cid), ins.pc)
-			end
-			i = j
-			continue
-		elseif op ~= OP.CAPTURE then
-			statements[#statements + 1] = inner_pad .. "-- " .. ins.name .. " A=" .. A .. " B=" .. B .. " C=" .. C .. " D=" .. D
+			return expr_of(A) .. (inv == 0 and " ~= " or " == ") .. k_text(proto, kid)
 		end
-
-		i += 1
+		return "true"
 	end
 
+	local pending_namecall = nil
+
+	local function process_range(from_i, to_i, ip, depth)
+		local i = from_i
+		while i <= to_i do
+			local ins = insns[i]
+			local op, A, B, C, D, aux = ins.op, ins.a, ins.b, ins.c, ins.d, ins.aux
+
+			if is_meta[op] then
+				i += 1
+				continue
+			end
+
+			-- Structured IF: jump skips the then-body
+			if is_cond_jump[op] and depth < 12 then
+				local target_pc = ins.pc + 1 + D
+				local target_idx = idx_at_pc(target_pc)
+				if target_idx and target_idx > i + 1 and target_idx <= to_i + 1 then
+					local body_from = i + 1
+					local body_to = target_idx - 1
+					-- else: unconditional jump at end of then-body
+					local else_from, else_to = nil, nil
+					if body_to >= body_from then
+						local last = insns[body_to]
+						if last and (last.op == OP.JUMP or last.op == OP.JUMPX) then
+							local end_pc = last.pc + 1 + (last.op == OP.JUMPX and last.e or last.d)
+							local end_idx = idx_at_pc(end_pc)
+							if end_idx and end_idx >= target_idx then
+								else_from = target_idx
+								else_to = end_idx - 1
+								body_to = body_to - 1 -- exclude the JUMP
+							end
+						end
+					end
+					emit(ip .. "if " .. if_condition(ins) .. " then")
+					if body_to >= body_from then
+						process_range(body_from, body_to, ip .. "    ", depth + 1)
+					end
+					if else_from and else_to and else_to >= else_from then
+						emit(ip .. "else")
+						process_range(else_from, else_to, ip .. "    ", depth + 1)
+						i = else_to + 1
+					else
+						i = target_idx
+					end
+					emit(ip .. "end")
+					continue
+				end
+			end
+
+			if op == OP.LOADNIL then
+				set_expr(A, "nil")
+			elseif op == OP.LOADB then
+				set_expr(A, B ~= 0 and "true" or "false")
+			elseif op == OP.LOADN then
+				set_expr(A, tostring(D))
+			elseif op == OP.LOADK then
+				set_expr(A, k_text(proto, D))
+			elseif op == OP.LOADKX then
+				set_expr(A, k_text(proto, aux or 0))
+			elseif op == OP.MOVE then
+				set_expr(A, expr_of(B))
+			elseif op == OP.GETGLOBAL then
+				local key = k_text(proto, aux or 0)
+				local val = (string.sub(key, 1, 1) == '"' and is_ident(string.sub(key, 2, -2))) and string.sub(key, 2, -2) or ("_G[" .. key .. "]")
+				set_expr(A, val)
+			elseif op == OP.SETGLOBAL then
+				local key = k_text(proto, aux or 0)
+				local name = (string.sub(key, 1, 1) == '"' and is_ident(string.sub(key, 2, -2))) and string.sub(key, 2, -2) or ("_G[" .. key .. "]")
+				emit(ip .. name .. " = " .. expr_of(A))
+			elseif op == OP.GETUPVAL then
+				set_expr(A, sanitize_name(proto.upvalue_names[B + 1] or ("up" .. B)))
+			elseif op == OP.SETUPVAL then
+				emit(ip .. sanitize_name(proto.upvalue_names[B + 1] or ("up" .. B)) .. " = " .. expr_of(A))
+			elseif op == OP.GETIMPORT then
+				set_expr(A, k_text(proto, D))
+			elseif op == OP.GETTABLE then
+				set_expr(A, expr_of(B) .. "[" .. expr_of(C) .. "]")
+			elseif op == OP.SETTABLE then
+				emit(ip .. expr_of(B) .. "[" .. expr_of(C) .. "] = " .. expr_of(A))
+			elseif op == OP.GETTABLEKS or op == OP.GETUDATAKS then
+				local kid = (op == OP.GETUDATAKS and aux) and bit32.band(aux, 65535) or (aux or 0)
+				set_expr(A, index_expr(expr_of(B), k_text(proto, kid)))
+			elseif op == OP.SETTABLEKS or op == OP.SETUDATAKS then
+				local kid = (op == OP.SETUDATAKS and aux) and bit32.band(aux, 65535) or (aux or 0)
+				emit(ip .. index_expr(expr_of(B), k_text(proto, kid)) .. " = " .. expr_of(A))
+			elseif op == OP.GETTABLEN then
+				set_expr(A, expr_of(B) .. "[" .. (C + 1) .. "]")
+			elseif op == OP.SETTABLEN then
+				emit(ip .. expr_of(B) .. "[" .. (C + 1) .. "] = " .. expr_of(A))
+			elseif op == OP.NAMECALL or op == OP.NAMECALLUDATA then
+				local kid = (op == OP.NAMECALLUDATA and aux) and bit32.band(aux, 65535) or (aux or 0)
+				local method = k_text(proto, kid)
+				local mname = string.sub(method, 1, 1) == '"' and string.sub(method, 2, -2) or method
+				pending_namecall = { A, expr_of(B), mname }
+				set_expr(A, expr_of(B) .. ":" .. mname)
+				set_expr(A + 1, expr_of(B))
+			elseif op == OP.CALL or op == OP.CALLFB then
+				local nrets = C - 1
+				local call
+				if pending_namecall and pending_namecall[1] == A then
+					local obj, method = pending_namecall[2], pending_namecall[3]
+					pending_namecall = nil
+					if B == 0 then
+						call = obj .. ":" .. method .. "(...)"
+					else
+						local parts = {}
+						for j = 0, math.max(B - 2, 0) - 1 do
+							parts[#parts + 1] = expr_of(A + 2 + j)
+						end
+						call = obj .. ":" .. method .. "(" .. table.concat(parts, ", ") .. ")"
+					end
+				else
+					if B == 0 then
+						call = expr_of(A) .. "(...)"
+					else
+						local parts = {}
+						for j = 0, math.max(B - 1, 0) - 1 do
+							parts[#parts + 1] = expr_of(A + 1 + j)
+						end
+						call = expr_of(A) .. "(" .. table.concat(parts, ", ") .. ")"
+					end
+				end
+				if nrets == 0 then
+					emit(ip .. call)
+				elseif nrets == 1 or nrets < 0 then
+					bind_local(A, call, ins.pc, ip)
+				else
+					local names = {}
+					for j = 0, nrets - 1 do
+						local nm = local_name_at(proto, A + j, ins.pc) or ("v" .. (A + j))
+						names[#names + 1] = nm
+						regs[A + j] = nm
+						declared[A + j] = true
+					end
+					emit(ip .. "local " .. table.concat(names, ", ") .. " = " .. call)
+				end
+			elseif op == OP.RETURN then
+				if B == 1 then
+					if not is_main then
+						emit(ip .. "return")
+					end
+				elseif B == 0 then
+					emit(ip .. "return ...")
+				else
+					local vals = {}
+					for j = 0, B - 2 do
+						vals[#vals + 1] = expr_of(A + j)
+					end
+					emit(ip .. "return " .. table.concat(vals, ", "))
+				end
+			elseif op == OP.JUMP or op == OP.JUMPBACK or op == OP.JUMPX then
+				-- structured recovery handles real control flow; ignore residual
+			elseif op == OP.ADD or op == OP.SUB or op == OP.MUL or op == OP.DIV or op == OP.MOD or op == OP.POW or op == OP.IDIV then
+				local opsym = ({ [OP.ADD] = "+", [OP.SUB] = "-", [OP.MUL] = "*", [OP.DIV] = "/", [OP.MOD] = "%", [OP.POW] = "^", [OP.IDIV] = "//" })[op]
+				set_expr(A, "(" .. expr_of(B) .. " " .. opsym .. " " .. expr_of(C) .. ")")
+			elseif op == OP.ADDK or op == OP.SUBK or op == OP.MULK or op == OP.DIVK or op == OP.MODK or op == OP.POWK or op == OP.IDIVK then
+				local opsym = ({ [OP.ADDK] = "+", [OP.SUBK] = "-", [OP.MULK] = "*", [OP.DIVK] = "/", [OP.MODK] = "%", [OP.POWK] = "^", [OP.IDIVK] = "//" })[op]
+				set_expr(A, "(" .. expr_of(B) .. " " .. opsym .. " " .. k_text(proto, C) .. ")")
+			elseif op == OP.SUBRK then
+				set_expr(A, "(" .. k_text(proto, B) .. " - " .. expr_of(C) .. ")")
+			elseif op == OP.DIVRK then
+				set_expr(A, "(" .. k_text(proto, B) .. " / " .. expr_of(C) .. ")")
+			elseif op == OP.AND then
+				set_expr(A, "(" .. expr_of(B) .. " and " .. expr_of(C) .. ")")
+			elseif op == OP.OR then
+				set_expr(A, "(" .. expr_of(B) .. " or " .. expr_of(C) .. ")")
+			elseif op == OP.ANDK then
+				set_expr(A, "(" .. expr_of(B) .. " and " .. k_text(proto, C) .. ")")
+			elseif op == OP.ORK then
+				set_expr(A, "(" .. expr_of(B) .. " or " .. k_text(proto, C) .. ")")
+			elseif op == OP.CONCAT then
+				local parts = {}
+				for j = B, C do
+					parts[#parts + 1] = expr_of(j)
+				end
+				set_expr(A, table.concat(parts, " .. "))
+			elseif op == OP.NOT then
+				set_expr(A, "(not " .. expr_of(B) .. ")")
+			elseif op == OP.MINUS then
+				set_expr(A, "(-" .. expr_of(B) .. ")")
+			elseif op == OP.LENGTH then
+				set_expr(A, "#" .. expr_of(B))
+			elseif op == OP.NEWTABLE then
+				set_expr(A, "{}")
+			elseif op == OP.DUPTABLE then
+				set_expr(A, k_text(proto, D))
+			elseif op == OP.SETLIST then
+				local count = B - 1
+				local starti = aux or 1
+				if count >= 0 then
+					for j = 0, count - 1 do
+						emit(ip .. expr_of(A) .. "[" .. (starti + j) .. "] = " .. expr_of(A + 1 + j))
+					end
+				end
+			elseif op == OP.FORNPREP then
+				local var = slot(A + 3, ins.pc)
+				declared[A + 3] = true
+				regs[A + 3] = var
+				emit(ip .. "for " .. var .. " = " .. expr_of(A + 2) .. ", " .. expr_of(A) .. ", " .. expr_of(A + 1) .. " do")
+				-- body continues until FORNLOOP
+			elseif op == OP.FORNLOOP then
+				emit(ip .. "end")
+			elseif op == OP.FORGPREP or op == OP.FORGPREP_INEXT or op == OP.FORGPREP_NEXT then
+				local nvars = 2
+				for j = i + 1, math.min(i + 64, to_i) do
+					if insns[j].op == OP.FORGLOOP then
+						nvars = math.max(1, bit32.band(insns[j].aux or 2, 255))
+						break
+					end
+				end
+				local vars = {}
+				for j = 0, nvars - 1 do
+					local nm = slot(A + 3 + j, ins.pc)
+					vars[#vars + 1] = nm
+					declared[A + 3 + j] = true
+					regs[A + 3 + j] = nm
+				end
+				local gen, state = expr_of(A), expr_of(A + 1)
+				local iter = (gen == "pairs" or gen == "ipairs" or gen == "next") and (gen .. "(" .. state .. ")") or (gen .. ", " .. state)
+				emit(ip .. "for " .. table.concat(vars, ", ") .. " in " .. iter .. " do")
+			elseif op == OP.FORGLOOP then
+				emit(ip .. "end")
+			elseif op == OP.GETVARARGS then
+				if B == 0 then
+					set_expr(A, "...")
+				elseif B > 1 then
+					local names = {}
+					for j = 0, B - 2 do
+						local nm = local_name_at(proto, A + j, ins.pc) or ("v" .. (A + j))
+						names[#names + 1] = nm
+						declared[A + j] = true
+						regs[A + j] = nm
+					end
+					emit(ip .. "local " .. table.concat(names, ", ") .. " = ...")
+				end
+			elseif op == OP.NEWCLOSURE or op == OP.DUPCLOSURE then
+				local cid
+				if op == OP.NEWCLOSURE then
+					cid = proto.child_ids[D + 1] or D
+				else
+					local ck = proto.constants[D + 1]
+					cid = (ck and ck.kind == "closure" and ck.value) or D
+				end
+				local j = i + 1
+				while j <= to_i and insns[j].op == OP.CAPTURE do
+					j += 1
+				end
+				local child = chunk.protos[cid + 1]
+				if child then
+					local fname = child.debugname and sanitize_name(child.debugname) or ("anon_" .. child.index)
+					emit(lift_proto(chunk, child, false, indent + (is_main and 0 or 1) + (depth > 0 and depth or 0)))
+					set_expr(A, fname)
+				else
+					set_expr(A, "(function() end)")
+				end
+				i = j
+				continue
+			end
+			i += 1
+		end
+	end
+
+	local ip0 = is_main and pad or (pad .. "    ")
 	if not is_main then
-		statements[#statements + 1] = pad .. "end"
+		local fname = proto.debugname and sanitize_name(proto.debugname) or ("anon_" .. proto.index)
+		emit(pad .. "function " .. fname .. "(" .. table.concat(params, ", ") .. ")")
 	end
-	return table.concat(statements, "\n")
+	process_range(1, n, ip0, 0)
+	if not is_main then
+		emit(pad .. "end")
+	end
+	return table.concat(lines, "\n")
 end
 
 local function decompile_bytecode(data)
 	local chunk = decode_chunk(data)
-	local header = {
-		"-- " .. VERSION_NAME,
-		"-- " .. CREDIT_LINE,
-		"-- bytecode v" .. chunk.version .. " (Luau v3-v9 family)",
-		"-- static reconstruction; names come from debug info when present",
-		"",
-	}
-	return table.concat(header, "\n") .. lift_proto(chunk, chunk.protos[chunk.main + 1], true, 0) .. "\n"
+	return lift_proto(chunk, chunk.protos[chunk.main + 1], true, 0) .. "\n"
 end
 
 local function decompile(source)
