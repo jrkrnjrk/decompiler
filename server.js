@@ -28,8 +28,9 @@ app.get("/health", (_req, res) => {
 
 function runLeo(base64) {
   return new Promise((resolve, reject) => {
-    const child = spawn(LUAU_BIN, [LEO_CLI, base64], {
-      stdio: ["ignore", "pipe", "pipe"],
+    // Pass bytecode on stdin — Luau CLI treats extra argv as files to open.
+    const child = spawn(LUAU_BIN, [LEO_CLI], {
+      stdio: ["pipe", "pipe", "pipe"],
       env: process.env,
     });
 
@@ -55,6 +56,14 @@ function runLeo(base64) {
       if (code === 0) resolve(stdout);
       else reject(new Error(stderr.trim() || `luau exit ${code}`));
     });
+
+    try {
+      child.stdin.write(base64);
+      child.stdin.end();
+    } catch (err) {
+      clearTimeout(timer);
+      reject(err);
+    }
   });
 }
 
@@ -75,9 +84,12 @@ app.post("/decompile", async (req, res) => {
       return res.status(400).json({ ok: false, error: "bytecode too short" });
     }
 
+    console.log(`[decompile] b64 length=${b64.length}`);
     const source = await runLeo(b64);
+    console.log(`[decompile] ok source length=${(source || "").length}`);
     res.json({ ok: true, source: source || "" });
   } catch (err) {
+    console.error("[decompile] fail", err && err.message ? err.message : err);
     res.status(500).json({ ok: false, error: String(err && err.message ? err.message : err) });
   }
 });

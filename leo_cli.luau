@@ -961,46 +961,40 @@ return Leo
 end)()
 
 
-local function b64decode(data)
-	local alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
-	data = string.gsub(data or "", "[^" .. alphabet .. "=]", "")
-	local out = {}
-	local pad = 0
-	for i = 1, #data, 4 do
-		local n = 0
-		for j = 0, 3 do
-			local c = string.sub(data, i + j, i + j)
-			if c == "=" or c == "" then
-				pad += 1
-				n = n * 64
-			else
-				local p = string.find(alphabet, c, 1, true)
-				if not p then
-					error("bad b64")
-				end
-				n = n * 64 + (p - 1)
-			end
-		end
-		local b1 = bit32.rshift(n, 16) % 256
-		local b2 = bit32.rshift(n, 8) % 256
-		local b3 = n % 256
-		out[#out + 1] = string.char(b1)
-		if pad < 2 then out[#out + 1] = string.char(b2) end
-		if pad < 1 then out[#out + 1] = string.char(b3) end
-	end
-	return table.concat(out)
-end
-
 local input = ""
-if arg and arg[1] and arg[1] ~= "" then
-	input = arg[1]
-else
-	input = io.read("*a") or ""
-end
+-- Prefer stdin (server pipes base64 here). Ignore argv to avoid Luau opening it as a file.
+input = io.read("*a") or ""
 input = string.gsub(input, "%s+", "")
 if input == "" then
 	io.stderr:write("empty input\n")
 	os.exit(1)
+end
+
+local function b64decode(data)
+	local alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+	data = string.gsub(data or "", "[^" .. alphabet .. "=]", "")
+	local out = {}
+	local i = 1
+	while i <= #data do
+		local function val(ch)
+			if ch == "=" or ch == "" then return nil end
+			local p = string.find(alphabet, ch, 1, true)
+			if not p then error("bad b64 char") end
+			return p - 1
+		end
+		local c1 = string.sub(data, i, i)
+		local c2 = string.sub(data, i + 1, i + 1)
+		local c3 = string.sub(data, i + 2, i + 2)
+		local c4 = string.sub(data, i + 3, i + 3)
+		local n1, n2, n3, n4 = val(c1), val(c2), val(c3), val(c4)
+		if not n1 or not n2 then break end
+		local n = n1 * 262144 + n2 * 4096 + (n3 or 0) * 64 + (n4 or 0)
+		out[#out + 1] = string.char(bit32.rshift(n, 16) % 256)
+		if n3 then out[#out + 1] = string.char(bit32.rshift(n, 8) % 256) end
+		if n4 then out[#out + 1] = string.char(n % 256) end
+		i += 4
+	end
+	return table.concat(out)
 end
 
 local ok, raw = pcall(b64decode, input)
