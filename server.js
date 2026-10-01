@@ -44,7 +44,7 @@ app.use(express.text({ type: ["text/*", "application/xml", "application/x-lua"],
 app.get("/health", (_req, res) => {
   res.json({
     ok: true,
-    version: "2.0.3",
+    version: "2.0.4",
     luau: LUAU_BIN,
     cli: fs.existsSync(LEO_CLI),
     formats: SUPPORTED,
@@ -60,7 +60,7 @@ function runLeo(buffer, encoding) {
     const id = crypto.randomBytes(8).toString("hex");
     const jobPath = path.join(os.tmpdir(), `leo_job_${id}.luau`);
     const b64 = buffer.toString("base64");
-    const hint = encoding === "vanilla" || encoding === "roblox" ? encoding : "auto";
+    const hint = encoding === "vanilla" ? "vanilla" : "roblox";
 
     let leoLib;
     try {

@@ -371,8 +371,10 @@ local function decode_chunk(data, opts)
 	end
 
 	for pi = 0, proto_count - 1 do
+		local proto_size, proto_start = 0, r.pos
 		if read_proto_size then
-			r:varint()
+			proto_size = r:varint()
+			proto_start = r.pos
 		end
 		local p = {
 			index = pi,
@@ -529,7 +531,20 @@ local function decode_chunk(data, opts)
 		end
 
 		if read_feedback then
-			r:varint()
+			local nfeed = r:varint()
+			for _ = 1, nfeed do
+				r:u8()
+				r:varint()
+			end
+		end
+		if read_proto_size and bit32.band(p.flags or 0, 8) ~= 0 then
+			r:varint64()
+		end
+		if read_proto_size and proto_size > 0 then
+			local endpos = proto_start + proto_size
+			if endpos >= r.pos and endpos <= r.len then
+				r.pos = endpos
+			end
 		end
 
 		protos[#protos + 1] = p
@@ -640,13 +655,7 @@ local function score_encoding(protos, mode)
 end
 
 local function select_encoding(protos, hint)
-	if hint == "roblox" or hint == "vanilla" then
-		ENCODING = hint
-		return hint
-	end
-	local roblox_score = score_encoding(protos, "roblox")
-	local vanilla_score = score_encoding(protos, "vanilla")
-	if vanilla_score > roblox_score then
+	if hint == "vanilla" then
 		ENCODING = "vanilla"
 		return "vanilla"
 	end
