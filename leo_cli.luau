@@ -465,7 +465,11 @@ local function decode_chunk(data)
 				local c = p.constants[cnid + 1]
 				p.constants[#p.constants + 1] = { kind = "class_shape", value = { name = c and const_render(c) or ("k" .. cnid), members = members } }
 			else
-				error(DecodeError("unknown constant tag " .. tag .. " in proto " .. pi), 0)
+				-- Keep the proto. Roblox client blobs sometimes carry a tag this
+				-- build does not know yet; aborting here used to 500 the API.
+				p.constants[#p.constants + 1] = { kind = "unknown", value = tag }
+				p.decode_warning = string.format("unknown constant tag %d at offset %d in proto %d", tag, r.pos - 1, pi)
+				break
 			end
 		end
 
@@ -527,6 +531,13 @@ local function decode_chunk(data)
 		error(DecodeError("main proto index out of range"), 0)
 	end
 
+	local warning = nil
+	for _, proto in protos do
+		if proto.decode_warning then
+			warning = proto.decode_warning
+			break
+		end
+	end
 	return {
 		version = version,
 		types_version = types_version,
@@ -534,6 +545,7 @@ local function decode_chunk(data)
 		userdata_types = userdata_types,
 		protos = protos,
 		main = main,
+		decode_warning = warning,
 	}
 end
 
@@ -1029,7 +1041,15 @@ local function decompile_bytecode(data, hint)
 			kind = "compiler-error",
 		}
 	end
-	local chunk = decode_chunk(data)
+	local ok_chunk, chunk = pcall(decode_chunk, data)
+	if not ok_chunk then
+		return "-- Leo decode error\n--[[\n" .. tostring(chunk) .. "\n]]\n", {
+			version = version_byte,
+			encoding = hint or "auto",
+			protos = 0,
+			kind = "decode-error",
+		}
+	end
 	apply_encoding(chunk, hint)
 	local meta = {
 		version = chunk.version,
@@ -1037,8 +1057,11 @@ local function decompile_bytecode(data, hint)
 		encoding = chunk.encoding,
 		protos = #chunk.protos,
 		main = chunk.main,
-		kind = "luau-bytecode",
+		kind = chunk.decode_warning and "disassembly" or "luau-bytecode",
 	}
+	if chunk.decode_warning or not chunk.protos[chunk.main + 1] then
+		return disassemble(chunk) .. "-- " .. tostring(chunk.decode_warning or "no main proto") .. "\n", meta
+	end
 	local ok, source = pcall(lift_proto, chunk, chunk.protos[chunk.main + 1], true, 0)
 	if not ok then
 		return disassemble(chunk) .. "-- lift error: " .. tostring(source) .. "\n", meta
