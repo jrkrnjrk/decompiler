@@ -319,7 +319,8 @@ local function decode_instructions(code)
 	return out
 end
 
-local function decode_chunk(data)
+local function decode_chunk(data, opts)
+	opts = opts or {}
 	if data == nil or data == "" then
 		error(DecodeError("empty input"), 0)
 	end
@@ -360,9 +361,17 @@ local function decode_chunk(data)
 
 	local proto_count = r:varint()
 	local protos = {}
+	local read_proto_size = opts.readProtoSize
+	local read_feedback = opts.readFeedback
+	if read_proto_size == nil then
+		read_proto_size = version >= 12
+	end
+	if read_feedback == nil then
+		read_feedback = version >= 11
+	end
 
 	for pi = 0, proto_count - 1 do
-		if version >= 12 then
+		if read_proto_size then
 			r:varint()
 		end
 		local p = {
@@ -519,7 +528,7 @@ local function decode_chunk(data)
 			end
 		end
 
-		if version >= 11 then
+		if read_feedback then
 			r:varint()
 		end
 
@@ -546,7 +555,56 @@ local function decode_chunk(data)
 		protos = protos,
 		main = main,
 		decode_warning = warning,
+		consumed = r.pos,
+		length = r.len,
+		read_proto_size = read_proto_size,
+		read_feedback = read_feedback,
 	}
+end
+
+local function decode_best(data)
+	local skips = { 0, 1, 2, 4, 8 }
+	local modes = {
+		{ nil, nil },
+		{ false, true },
+		{ true, false },
+		{ false, false },
+	}
+	local best, best_score, last_err
+	for _, skip in skips do
+		local slice = skip == 0 and data or string.sub(data, skip + 1)
+		local ver = string.byte(slice or "", 1)
+		if ver and ((ver >= 1 and ver <= 14) or ver == 100 or ver == 0) then
+			for _, mode in modes do
+				local ok, chunk = pcall(decode_chunk, slice, { readProtoSize = mode[1], readFeedback = mode[2] })
+				if ok and type(chunk) == "table" and chunk.protos then
+					local exact = chunk.consumed == chunk.length
+					local score = (exact and 1000000 or 0) + (chunk.consumed or 0) * 10
+					if chunk.decode_warning then
+						score -= 20000
+					end
+					if not chunk.protos[chunk.main + 1] then
+						score -= 50000
+					end
+					if not best or score > best_score then
+						best = chunk
+						best_score = score
+						best.header_skip = skip
+				end
+					if exact and not chunk.decode_warning and chunk.protos[chunk.main + 1] then
+						chunk.header_skip = skip
+						return chunk
+					end
+				else
+					last_err = chunk
+				end
+			end
+		end
+	end
+	if best then
+		return best
+	end
+	error(last_err or DecodeError("no bytecode layout matched"), 0)
 end
 
 local function score_encoding(protos, mode)
@@ -1041,9 +1099,9 @@ local function decompile_bytecode(data, hint)
 			kind = "compiler-error",
 		}
 	end
-	local ok_chunk, chunk = pcall(decode_chunk, data)
+	local ok_chunk, chunk = pcall(decode_best, data)
 	if not ok_chunk then
-		return "-- Leo decode error\n--[[\n" .. tostring(chunk) .. "\n]]\n", {
+		return "-- Leo decode error\n--[[\n" .. tostring(chunk) .. "\nbytecode version byte " .. tostring(version_byte) .. ", length " .. tostring(#data) .. "\n]]\n", {
 			version = version_byte,
 			encoding = hint or "auto",
 			protos = 0,
