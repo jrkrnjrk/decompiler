@@ -1,14 +1,19 @@
 -- Server CLI for Leo decompiler
 -- Usage: luau leo_cli.luau <base64-bytecode>
 --    or: echo <base64> | luau leo_cli.luau
+-- Accepts official Luau bytecode (vanilla opcodes) and Roblox client bytecode
+-- (opcode byte encrypted, decoded with * 203 % 256), versions 1-14 and 100.
 
 local Leo = (function()
--- Leo Luau Decompiler 1.0
+-- Leo Luau Decompiler 2.0
 -- MADE BY LEO
--- Static decompiler for official Luau bytecode v3-v9 (target v9). Input is never executed.
+-- Static decompiler for every compiled Luau form the runtime documents:
+-- official bytecode v1-v14, experimental class bytecode v100, and Roblox
+-- client bytecode. Input is never executed.
 
-local VERSION_NAME = "Leo Luau Decompiler 1.0"
+local VERSION_NAME = "Leo Luau Decompiler 2.0"
 local CREDIT_LINE = "MADE BY LEO"
+local ENCODING = "roblox" -- "roblox" | "vanilla"
 
 local OPCODES = {
 	"NOP", "BREAK", "LOADNIL", "LOADB", "LOADN", "LOADK", "MOVE",
@@ -149,6 +154,9 @@ end
 local ROBLOX_OP_KEY = 203
 local function insn_op(insn)
 	local enc = bit32.band(insn, 255)
+	if ENCODING == "vanilla" then
+		return enc
+	end
 	return (enc * ROBLOX_OP_KEY) % 256
 end
 local function insn_a(insn)
@@ -465,7 +473,11 @@ local function decode_chunk(data)
 		for _ = 1, sizep do
 			p.child_ids[#p.child_ids + 1] = r:varint()
 		end
-		p.linedefined = r:varint()
+		if version >= 2 then
+			p.linedefined = r:varint()
+		else
+			p.linedefined = 0
+		end
 		p.debugname = string_at(r:varint())
 
 		if r:u8() ~= 0 then
@@ -507,7 +519,6 @@ local function decode_chunk(data)
 			r:varint()
 		end
 
-		p.instructions = decode_instructions(p.code)
 		protos[#protos + 1] = p
 	end
 
@@ -524,6 +535,62 @@ local function decode_chunk(data)
 		protos = protos,
 		main = main,
 	}
+end
+
+local function score_encoding(protos, mode)
+	local prev = ENCODING
+	ENCODING = mode
+	local known, total, aux_ok, unknown = 0, 0, 0, 0
+	for _, proto in protos do
+		local pc, n = 0, #proto.code
+		while pc < n do
+			local op = insn_op(proto.code[pc + 1])
+			total += 1
+			if op >= 0 and op < #OPCODES then
+				known += 1
+				if AUX_OPS[op] then
+					if pc + 1 < n then
+						aux_ok += 1
+						pc += 2
+					else
+						unknown += 1
+						pc += 1
+					end
+				else
+					pc += 1
+				end
+			else
+				unknown += 1
+				pc += 1
+			end
+		end
+	end
+	ENCODING = prev
+	return known * 8 + aux_ok * 3 - unknown * 5, known, total
+end
+
+local function select_encoding(protos, hint)
+	if hint == "roblox" or hint == "vanilla" then
+		ENCODING = hint
+		return hint
+	end
+	local roblox_score = score_encoding(protos, "roblox")
+	local vanilla_score = score_encoding(protos, "vanilla")
+	if vanilla_score > roblox_score then
+		ENCODING = "vanilla"
+		return "vanilla"
+	end
+	ENCODING = "roblox"
+	return "roblox"
+end
+
+local function apply_encoding(chunk, hint)
+	local encoding = select_encoding(chunk.protos, hint)
+	for _, proto in chunk.protos do
+		proto.instructions = decode_instructions(proto.code)
+	end
+	chunk.encoding = encoding
+	return chunk
 end
 
 local function default_reg_name(proto, reg)
@@ -928,9 +995,55 @@ local function lift_proto(chunk, proto, is_main, indent)
 	return table.concat(lines, "\n")
 end
 
-local function decompile_bytecode(data)
+local function disassemble(chunk)
+	local lines = { "-- Leo disassembly (" .. (chunk.encoding or "?") .. ", bytecode v" .. tostring(chunk.version) .. ")" }
+	for _, proto in chunk.protos do
+		lines[#lines + 1] = string.format(
+			"-- proto %d %s params=%d stack=%d",
+			proto.index,
+			proto.debugname or "anon",
+			proto.numparams,
+			proto.maxstacksize
+		)
+		for _, ins in proto.instructions do
+			lines[#lines + 1] = string.format(
+				"  [%d] %-14s a=%d b=%d c=%d d=%d e=%d aux=%s",
+				ins.pc, ins.name, ins.a, ins.b, ins.c, ins.d, ins.e, tostring(ins.aux)
+			)
+		end
+	end
+	return table.concat(lines, "\n") .. "\n"
+end
+
+local function decompile_bytecode(data, hint)
+	if data == nil or data == "" then
+		error(DecodeError("empty input"), 0)
+	end
+	local version_byte = string.byte(data, 1)
+	if version_byte == 0 then
+		local msg = string.sub(data, 2)
+		return "-- Leo: compiler error bytecode\n--[[\n" .. msg .. "\n]]\n", {
+			version = 0,
+			encoding = "none",
+			protos = 0,
+			kind = "compiler-error",
+		}
+	end
 	local chunk = decode_chunk(data)
-	return lift_proto(chunk, chunk.protos[chunk.main + 1], true, 0) .. "\n"
+	apply_encoding(chunk, hint)
+	local meta = {
+		version = chunk.version,
+		types_version = chunk.types_version,
+		encoding = chunk.encoding,
+		protos = #chunk.protos,
+		main = chunk.main,
+		kind = "luau-bytecode",
+	}
+	local ok, source = pcall(lift_proto, chunk, chunk.protos[chunk.main + 1], true, 0)
+	if not ok then
+		return disassemble(chunk) .. "-- lift error: " .. tostring(source) .. "\n", meta
+	end
+	return source .. "\n", meta
 end
 
 local function decompile(source)
@@ -949,7 +1062,7 @@ local function decompile(source)
 	else
 		return "-- Leo: expected script or bytecode"
 	end
-	local ok, result = pcall(decompile_bytecode, data)
+	local ok, result = pcall(decompile_bytecode, data, "auto")
 	if not ok then
 		return "--[[ Leo decode/lift error:\n" .. tostring(result) .. "\n]]"
 	end
@@ -961,6 +1074,7 @@ local Leo = {
 	decompile = decompile,
 	decompile_bytecode = decompile_bytecode,
 	decode_chunk = decode_chunk,
+	disassemble = disassemble,
 }
 
 pcall(function()

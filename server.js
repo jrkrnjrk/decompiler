@@ -1,7 +1,13 @@
 /**
- * Leo remote decompiler API for Railway.
- * POST /decompile  { "bytecode": "<base64>" }
+ * Leo remote decompiler API.
+ * Decompiles compiled Luau bytecode and every container that carries it:
+ * raw / base64 / hex blobs, Roblox client bytecode, official Luau bytecode,
+ * .rbxm/.rbxl/.rbxmx/.rbxlx, and zip batches.
+ *
+ * POST /decompile   { "bytecode": "<base64>" }   (legacy)
+ * POST /decompile   raw bytes, hex, data-URI, model/place, or { scripts: [...] }
  * GET  /health
+ * GET  /formats
  */
 const express = require("express");
 const { spawn } = require("child_process");
@@ -9,28 +15,52 @@ const path = require("path");
 const fs = require("fs");
 const os = require("os");
 const crypto = require("crypto");
+const formats = require("./formats");
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 const LUAU_BIN = process.env.LUAU_BIN || "luau";
 const LEO_CLI = path.join(__dirname, "leo_cli.luau");
-const MAX_BODY = 8 * 1024 * 1024;
+const MAX_BODY = Number(process.env.MAX_BODY_BYTES || 32 * 1024 * 1024);
 const TIMEOUT_MS = Number(process.env.DECOMPILE_TIMEOUT_MS || 45000);
-const cache = new Map(); // key: b64 (or hash), value: source
+const cache = new Map();
 const CACHE_MAX = 500;
 
+const SUPPORTED = [
+  "luau-bytecode (official, vanilla opcodes, v1-v14 and v100)",
+  "roblox-client-bytecode (opcode * 203 % 256, auto-detected)",
+  "compiler-error blob (version byte 0)",
+  "base64, hex, and data-URI wrappers",
+  "rbxm / rbxl binary models and places (LZ4 and zstd chunks, Bytecode + Source)",
+  "rbxmx / rbxlx XML models and places",
+  "zip of any of the above",
+  "json batch: { scripts: [{ name, bytecode|hex|source }] }",
+];
+
 app.use(express.json({ limit: MAX_BODY }));
-app.use(express.text({ type: "*/*", limit: MAX_BODY }));
+app.use(express.raw({ type: ["application/octet-stream", "application/zip", "application/x-rbxm", "application/x-rbxl"], limit: MAX_BODY }));
+app.use(express.text({ type: ["text/*", "application/xml", "application/x-lua"], limit: MAX_BODY }));
 
 app.get("/health", (_req, res) => {
-  res.json({ ok: true, luau: LUAU_BIN, cli: fs.existsSync(LEO_CLI) });
+  res.json({
+    ok: true,
+    version: "2.0.0",
+    luau: LUAU_BIN,
+    cli: fs.existsSync(LEO_CLI),
+    formats: SUPPORTED,
+  });
 });
 
-function runLeo(base64) {
+app.get("/formats", (_req, res) => {
+  res.json({ ok: true, formats: SUPPORTED });
+});
+
+function runLeo(buffer, encoding) {
   return new Promise((resolve, reject) => {
-    // Luau CLI often has no `io` library, so we embed the payload in a temp script.
     const id = crypto.randomBytes(8).toString("hex");
     const jobPath = path.join(os.tmpdir(), `leo_job_${id}.luau`);
+    const b64 = buffer.toString("base64");
+    const hint = encoding === "vanilla" || encoding === "roblox" ? encoding : "auto";
 
     let leoLib;
     try {
@@ -39,8 +69,6 @@ function runLeo(base64) {
       reject(err);
       return;
     }
-
-    // Strip any previous CLI tail after the Leo IIFE so we only keep the library.
     const endMarker = "end)()";
     const endAt = leoLib.lastIndexOf(endMarker);
     if (endAt < 0) {
@@ -48,11 +76,10 @@ function runLeo(base64) {
       return;
     }
     const lib = leoLib.slice(0, endAt + endMarker.length);
-
-    // base64 alphabet cannot contain ]], safe for long strings
     const job = `${lib}
 
-local b64 = [[${base64}]]
+local b64 = [[${b64}]]
+local encoding = "${hint}"
 
 local function b64decode(data)
 	local alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
@@ -73,24 +100,25 @@ local function b64decode(data)
 		local n1, n2, n3, n4 = val(c1), val(c2), val(c3), val(c4)
 		if not n1 or not n2 then break end
 		local n = n1 * 262144 + n2 * 4096 + (n3 or 0) * 64 + (n4 or 0)
-		out[#out + 1] = string.char(bit32.rshift(n, 16) % 256)
-		if n3 then out[#out + 1] = string.char(bit32.rshift(n, 8) % 256) end
+		out[#out + 1] = string.char(math.floor(n / 65536) % 256)
+		if n3 then out[#out + 1] = string.char(math.floor(n / 256) % 256) end
 		if n4 then out[#out + 1] = string.char(n % 256) end
 		i += 4
 	end
 	return table.concat(out)
 end
 
-local ok, raw = pcall(b64decode, b64)
-if not ok or type(raw) ~= "string" or raw == "" then
-	error("invalid base64: " .. tostring(raw))
-end
-
-local ok2, result = pcall(Leo.decompile_bytecode, raw)
-if not ok2 then
-	error(tostring(result))
-end
-print(result or "")
+local raw = b64decode(b64)
+local source, meta = Leo.decompile_bytecode(raw, encoding)
+meta = meta or {}
+print(string.format(
+	"@@LEO@@%s|%s|%s|%s",
+	tostring(meta.kind or ""),
+	tostring(meta.version or ""),
+	tostring(meta.encoding or ""),
+	tostring(meta.protos or 0)
+))
+print(source or "")
 `;
 
     try {
@@ -113,12 +141,8 @@ print(result or "")
       reject(new Error("decompile timeout"));
     }, TIMEOUT_MS);
 
-    child.stdout.on("data", (c) => {
-      stdout += c.toString("utf8");
-    });
-    child.stderr.on("data", (c) => {
-      stderr += c.toString("utf8");
-    });
+    child.stdout.on("data", (c) => { stdout += c.toString("utf8"); });
+    child.stderr.on("data", (c) => { stderr += c.toString("utf8"); });
     child.on("error", (err) => {
       clearTimeout(timer);
       try { fs.unlinkSync(jobPath); } catch (_) {}
@@ -127,42 +151,93 @@ print(result or "")
     child.on("close", (code) => {
       clearTimeout(timer);
       try { fs.unlinkSync(jobPath); } catch (_) {}
-      if (code === 0) resolve(stdout);
-      else reject(new Error(stderr.trim() || `luau exit ${code}`));
+      if (code !== 0) {
+        reject(new Error(stderr.trim() || `luau exit ${code}`));
+        return;
+      }
+      const lines = stdout.split(/\r?\n/);
+      let meta = null;
+      if (lines[0] && lines[0].startsWith("@@LEO@@")) {
+        const parts = lines.shift().slice("@@LEO@@".length).split("|");
+        meta = { kind: parts[0], version: Number(parts[1]), encoding: parts[2], protos: Number(parts[3]) };
+      }
+      resolve({ source: lines.join("\n"), meta });
     });
   });
 }
 
+async function decompileOne(script) {
+  if (script.kind === "source" && script.source != null) {
+    return {
+      name: script.name,
+      className: script.className,
+      ok: true,
+      kind: "source",
+      source: script.source,
+      note: "already source, not compiled bytecode",
+    };
+  }
+  const buf = script.bytecode;
+  if (!buf || !buf.length) {
+    return { name: script.name, className: script.className, ok: false, error: "empty bytecode" };
+  }
+  const key = `${script.encoding || "auto"}:${buf.toString("base64")}`;
+  if (cache.has(key)) {
+    return { name: script.name, className: script.className, ok: true, cached: true, ...cache.get(key) };
+  }
+  const result = await runLeo(buf, script.encoding || "auto");
+  const record = {
+    source: result.source || "",
+    kind: result.meta && result.meta.kind,
+    version: result.meta && result.meta.version,
+    encoding: result.meta && result.meta.encoding,
+    protos: result.meta && result.meta.protos,
+  };
+  if (cache.size >= CACHE_MAX) cache.delete(cache.keys().next().value);
+  cache.set(key, record);
+  return { name: script.name, className: script.className, ok: true, ...record };
+}
+
 app.post("/decompile", async (req, res) => {
   try {
-    let b64 = null;
-    if (req.is("application/json") && req.body && typeof req.body === "object") {
-      b64 = req.body.bytecode || req.body.b64 || req.body.data;
-    } else if (typeof req.body === "string") {
-      b64 = req.body;
+    const collected = formats.collect(req.body, req.headers["content-type"] || "");
+    if (!collected.scripts.length) {
+      return res.status(400).json({
+        ok: false,
+        error: "no compiled scripts found (bytecode, hex, model, place, or scripts[] expected)",
+        format: collected.format,
+      });
     }
-
-    if (!b64 || typeof b64 !== "string") {
-      return res.status(400).json({ ok: false, error: "missing bytecode (base64)" });
+    const scripts = [];
+    for (const script of collected.scripts) {
+      try {
+        scripts.push(await decompileOne(script));
+      } catch (err) {
+        scripts.push({
+          name: script.name,
+          className: script.className,
+          ok: false,
+          error: String(err && err.message ? err.message : err),
+        });
+      }
     }
-    b64 = b64.replace(/\s+/g, "");
-    if (b64.length < 4) {
-      return res.status(400).json({ ok: false, error: "bytecode too short" });
-    }
-
-    if (cache.has(b64)) {
-      console.log(`[decompile] cache hit len=${b64.length}`);
-      return res.json({ ok: true, source: cache.get(b64), cached: true });
-    }
-    console.log(`[decompile] b64 length=${b64.length}`);
-    const source = await runLeo(b64);
-    if (cache.size >= CACHE_MAX) {
-      const first = cache.keys().next().value;
-      cache.delete(first);
-    }
-    cache.set(b64, source || "");
-    console.log(`[decompile] ok source length=${(source || "").length}`);
-    res.json({ ok: true, source: source || "" });
+    const okCount = scripts.filter((s) => s.ok).length;
+    const combined = scripts.map((s) => {
+      const header = `-- ${s.className ? s.className + " " : ""}${s.name || "script"}`;
+      return `${header}\n${s.ok ? s.source || "" : "-- error: " + s.error}`;
+    }).join("\n\n");
+    const single = scripts.length === 1 ? scripts[0] : null;
+    res.status(okCount ? 200 : 500).json({
+      ok: okCount > 0,
+      format: collected.format,
+      count: scripts.length,
+      source: single ? single.source || "" : combined,
+      version: single && single.version,
+      encoding: single && single.encoding,
+      kind: single && single.kind,
+      cached: single ? !!single.cached : undefined,
+      scripts,
+    });
   } catch (err) {
     console.error("[decompile] fail", err && err.message ? err.message : err);
     res.status(500).json({ ok: false, error: String(err && err.message ? err.message : err) });
