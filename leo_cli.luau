@@ -1085,6 +1085,10 @@ local function disassemble(chunk)
 	return table.concat(lines, "\n") .. "\n"
 end
 
+local function stamp(kind, source)
+	return "-- This decompiler was made by xxleo, enjoy! kind: " .. tostring(kind or "source") .. "\n" .. (source or "")
+end
+
 local function decompile_bytecode(data, hint)
 	if data == nil or data == "" then
 		error(DecodeError("empty input"), 0)
@@ -1092,7 +1096,7 @@ local function decompile_bytecode(data, hint)
 	local version_byte = string.byte(data, 1)
 	if version_byte == 0 then
 		local msg = string.sub(data, 2)
-		return "-- Leo: compiler error bytecode\n--[[\n" .. msg .. "\n]]\n", {
+		return stamp("compiler-error", "-- Leo: compiler error bytecode\n--[[\n" .. msg .. "\n]]\n"), {
 			version = 0,
 			encoding = "none",
 			protos = 0,
@@ -1101,7 +1105,7 @@ local function decompile_bytecode(data, hint)
 	end
 	local ok_chunk, chunk = pcall(decode_best, data)
 	if not ok_chunk then
-		return "-- Leo decode error\n--[[\n" .. tostring(chunk) .. "\nbytecode version byte " .. tostring(version_byte) .. ", length " .. tostring(#data) .. "\n]]\n", {
+		return stamp("decode-error", "-- Leo decode error\n--[[\n" .. tostring(chunk) .. "\nbytecode version byte " .. tostring(version_byte) .. ", length " .. tostring(#data) .. "\n]]\n"), {
 			version = version_byte,
 			encoding = hint or "auto",
 			protos = 0,
@@ -1118,13 +1122,13 @@ local function decompile_bytecode(data, hint)
 		kind = chunk.decode_warning and "disassembly" or "luau-bytecode",
 	}
 	if chunk.decode_warning or not chunk.protos[chunk.main + 1] then
-		return disassemble(chunk) .. "-- " .. tostring(chunk.decode_warning or "no main proto") .. "\n", meta
+		return stamp(meta.kind, disassemble(chunk) .. "-- " .. tostring(chunk.decode_warning or "no main proto") .. "\n"), meta
 	end
 	local ok, source = pcall(lift_proto, chunk, chunk.protos[chunk.main + 1], true, 0)
 	if not ok then
-		return disassemble(chunk) .. "-- lift error: " .. tostring(source) .. "\n", meta
+		return stamp("disassembly", disassemble(chunk) .. "-- lift error: " .. tostring(source) .. "\n"), meta
 	end
-	return source .. "\n", meta
+	return stamp(meta.kind, source .. "\n"), meta
 end
 
 local function decompile(source)
